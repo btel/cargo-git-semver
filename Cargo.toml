@@ -1,6 +1,10 @@
 [package]
 name = "cargo-git-semver"
 version = "0.6.0"
+license = "MIT OR Apache-2.0"
+description = "automatically update package version from git tags"
+repository = "https://github.com/btel/cargo-git-semver"
+readme = "README.md"
 
 [dependencies]
 clap = { version = "4.4.6", features = ["derive"] }
