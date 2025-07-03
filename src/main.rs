@@ -9,7 +9,7 @@ extern crate tempfile;
 extern crate thiserror;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use git2::{DescribeFormatOptions, DescribeOptions, DiffOptions, ObjectType, Repository};
+use git2::{DescribeFormatOptions, DescribeOptions, DiffOptions, ObjectType, Repository, Object};
 
 use anyhow::{anyhow, Context};
 use regex::Regex;
@@ -118,12 +118,39 @@ fn get_cargo_version(repo: &Repository) -> anyhow::Result<Version> {
     parse_cargo_version(&contents)
 }
 
-fn get_cargo_version_main(repo: &Repository, default_branch: &str) -> anyhow::Result<Version> {
-    let refname = format!("{}:Cargo.toml", default_branch);
-    let object = repo.revparse_single(&refname)?;
+fn revparse_default_branch<'repo>(repo: &'repo Repository, obj_name: Option<&'_ str>) -> anyhow::Result<Object<'repo>> 
+{
+
+    let mut last_error = anyhow!("should not happen");
+    let default_branch = repo.config()?.get_string("init.defaultBranch")?;
+    for branch_name in ["master", "main", &default_branch] {
+        let refname = if let Some(name) = obj_name {
+            &format!("{}:{}", branch_name, name)
+        }
+        else {
+            branch_name
+        };
+        
+        let object = repo.revparse_single(&refname);
+
+        match object {
+            Ok(obj) => {
+                return Ok(obj)
+            },
+            Err(err) => {
+                last_error = err.into();
+            }
+
+        };
+    }
+    Err(last_error)
+}
+
+fn get_cargo_version_main(repo: &Repository) -> anyhow::Result<Version> {
+    let object = revparse_default_branch(repo, Some(&"Cargo.toml"))?;
     let blob = object
         .as_blob()
-        .context(format!("could not find {}", &refname))?;
+        .context("could not find Cargo.toml")?;
     let mut content = String::new();
     blob.content().read_to_string(&mut content)?;
     let version = parse_cargo_version(&content)?;
@@ -203,7 +230,7 @@ fn make_dev_prerelease(
 fn is_repo_dirty(repo: &Repository, filetype: Option<&str>) -> anyhow::Result<bool> {
    
     // Use revparse_single to get the object for the default branch
-    let obj = repo.revparse_single("main")?;
+    let obj = revparse_default_branch(repo, None)?;
 
     // Peel the object to a commit
     let commit = obj.peel_to_commit()?;
@@ -324,12 +351,8 @@ fn run_sem_ver_repo(
         VersioningKindArg::SemverCommit => VersioningKind::SemverCommit(head_ref[0..5].to_string()),
     };
 
-    let default_branch = repo.config()?.get_string("init.defaultBranch")?;
 
-    let main_ver = get_cargo_version_main(&repo, &"main")
-        .or_else(|_| get_cargo_version_main(&repo, &"master")).or_else(
-            |_| get_cargo_version_main(&repo, &default_branch)
-            )?;
+    let main_ver = get_cargo_version_main(&repo)?;
     log::debug!("default branch version is {}", &main_ver);
     let new_version = {
         let patch_number = if main_ver.pre.is_empty() { main_ver.patch + 1} else { main_ver.patch }; 
