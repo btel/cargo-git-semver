@@ -9,9 +9,9 @@ extern crate tempfile;
 extern crate thiserror;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use git2::{DescribeFormatOptions, DescribeOptions, DiffOptions, Repository};
+use git2::{DescribeFormatOptions, DescribeOptions, DiffOptions, ObjectType, Repository, Object};
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use regex::Regex;
 use semver::{BuildMetadata, Prerelease, Version};
 use std::{fs, io::Read, path::Path};
@@ -118,6 +118,47 @@ fn get_cargo_version(repo: &Repository) -> anyhow::Result<Version> {
     parse_cargo_version(&contents)
 }
 
+fn revparse_default_branch<'repo>(repo: &'repo Repository, obj_name: Option<&'_ str>) -> anyhow::Result<Object<'repo>> 
+{
+
+    let mut last_error = anyhow!("should not happen");
+    let default_branch = repo.config()?.get_string("init.defaultBranch")?;
+    for branch_name in ["refs/remotes/origin/main", "refs/remotes/origin/master", "master", "main", &default_branch] {
+        let refname = if let Some(name) = obj_name {
+            &format!("{}:{}", branch_name, name)
+        }
+        else {
+            branch_name
+        };
+        
+        let object = repo.revparse_single(&refname);
+
+        match object {
+            Ok(obj) => {
+                log::debug!("found default branch at {}", &branch_name); 
+                return Ok(obj)
+            },
+            Err(err) => {
+                last_error = err.into();
+            }
+
+        };
+    }
+    Err(last_error)
+}
+
+fn get_cargo_version_main(repo: &Repository) -> anyhow::Result<Version> {
+    let object = revparse_default_branch(repo, Some(&"Cargo.toml"))?;
+    let blob = object
+        .as_blob()
+        .context("could not find Cargo.toml")?;
+    let mut content = String::new();
+    blob.content().read_to_string(&mut content)?;
+    let version = parse_cargo_version(&content)?;
+    println!("{}", &version);
+    Ok(version)
+}
+
 fn open_repository(path: &str) -> anyhow::Result<Repository> {
     Repository::discover(path).context("Error openning repository")
 }
@@ -142,6 +183,20 @@ fn get_latest_tag(repo: &Repository, abbrv_size: u32) -> anyhow::Result<Version>
         .with_context(|| format!("error parsing version from git tag {}", version_str))
 }
 
+/// get number of commits from given ref
+fn get_n_commits(pre: &Prerelease) -> anyhow::Result<u16> {
+    let pre_str = pre.as_str();
+    let pre_parts: Vec<&str> = pre.split('.').collect();
+    let n_commits_from_last_tag = match pre_parts[..] {
+        [_, n_commits] => n_commits
+            .parse::<u16>()
+            .and_then(|parsed| Ok(parsed))
+              .with_context(|| format!("can't create dev prerelease from tag {}", pre_str)),
+        _ => Err(VersionHookError::Other(format!("can not parse prerelease tag {}", &pre.to_string())).into()),
+    }?;
+    Ok(n_commits_from_last_tag)
+}
+
 fn make_dev_prerelease(
     pre: Prerelease,
     mode: VersioningKind,
@@ -160,43 +215,57 @@ fn make_dev_prerelease(
     if pre.is_empty() {
         return Ok(Prerelease::new(&mk_prerelease_str(1, mode)).unwrap());
     }
-    let pre_str = pre.as_str();
-    let pre_parts: Vec<&str> = pre.split('-').collect();
 
-    let (n_commits_from_last_tag, _last_commit) = match pre_parts[..] {
-        [n_commits, last_commit] => n_commits
-            .parse::<i32>()
-            .and_then(|parsed| Ok((parsed, last_commit)))
-            .with_context(|| format!("can't create dev prerelease from tag {}", pre_str)),
-        _ => Err(VersionHookError::Other("wrong tag format".to_string()).into()),
-    }?;
+    let n_commits = get_n_commits(&pre)?;
+
     let new_pre_str = if is_dirty {
-        mk_prerelease_str(n_commits_from_last_tag + 1, mode)
+        mk_prerelease_str(n_commits + 1, mode)
     } else {
-        mk_prerelease_str(n_commits_from_last_tag, mode)
+        mk_prerelease_str(n_commits, mode)
     };
     Prerelease::new(&new_pre_str)
         .with_context(|| format!("prerelease string {} is not valid", &new_pre_str))
 }
 
 // Check if repo is in dirty state (some files were modified)
-fn is_repo_dirty(repo: &Repository, filetype: Option<&str>) -> bool {
-    for entry in repo.statuses(None).unwrap().into_iter() {
-        if let Some(extension) = filetype {
-            if let Some(s) = entry.path() {
-                if !s.ends_with(extension) {
-                    continue;
+fn is_repo_dirty(repo: &Repository, filetype: Option<&str>) -> anyhow::Result<bool> {
+   
+    // Use revparse_single to get the object for the default branch
+    let obj = revparse_default_branch(repo, None)?.id();
+
+
+    let head_oid = repo.head()?.target().context("Invalid HEAD")?;
+
+    // Find the merge base (most recent common ancestor)
+    let merge_base = repo.merge_base(obj, head_oid)?;
+
+    let commit = repo.find_commit(merge_base)?;
+
+    // Get the tree from the commit
+    let tree = commit.tree()?;
+
+    let mut changed = false;
+    let index = repo.index()?;
+    let diff = repo.diff_tree_to_index(Some(&tree), Some(&index), None)?;
+    if let Some(ext) = filetype {
+
+        diff.foreach(
+            &mut |delta, _| {
+                if let Some(path) = delta.new_file().path() {
+                    if path.extension().and_then(|s| s.to_str()) == Some(ext) {
+                        changed = true;
+                    }
                 }
-            } else {
-                continue;
-            };
-        };
-        match entry.status() {
-            git2::Status::IGNORED | git2::Status::WT_NEW => continue,
-            _ => return true,
-        }
+                true
+            },
+            None, None, None,
+        )?;
     }
-    false
+    else {
+        changed = diff.deltas().len() > 0;
+    };
+
+    Ok(changed)
 }
 
 // get cargo.toml from staging area
@@ -268,32 +337,43 @@ fn run_sem_ver_repo(
     let cargo_ver = get_cargo_version(repo)?;
     //let mode = VersioningKind::SemverCommit((&head_ref[0..5]).to_string());
 
-    let is_dirty = is_repo_dirty(repo, filetype);
+    let is_dirty = is_repo_dirty(repo, filetype)?;
 
     let latest_tag_str = get_latest_tag(repo, 0)?.to_string();
 
     log::debug!("latest tag is {}", &latest_tag_str);
 
-    let changed_from_last_version =
-        check_rs_files_changed(repo, &latest_tag_str, "HEAD").unwrap_or(true);
+    // let changed_from_last_version =
+    //    check_rs_files_changed(repo, &latest_tag_str, "HEAD").unwrap_or(true);
 
-    if !is_dirty && !changed_from_last_version {
-        println!("No rust files changed since last tag {}", latest_tag_str);
-        return Ok(());
-    };
+    // if !is_dirty && !changed_from_last_version {
+    //    println!("No rust files changed since last tag {}", latest_tag_str);
+    //    return Ok(());
+    // };
 
     let mode = match mode_arg {
         VersioningKindArg::PEP440 => VersioningKind::PEP440,
         VersioningKindArg::Semver => VersioningKind::Semver,
         VersioningKindArg::SemverCommit => VersioningKind::SemverCommit(head_ref[0..5].to_string()),
     };
-    let new_version = Version {
-        major: sem_ver.major,
-        minor: sem_ver.minor,
-        patch: sem_ver.patch + 1,
-        pre: make_dev_prerelease(sem_ver.pre, mode, is_dirty)?,
-        build: BuildMetadata::EMPTY,
+
+
+    let main_ver = get_cargo_version_main(&repo)?;
+    log::debug!("default branch version is {}", &main_ver);
+    let new_version = if is_dirty {
+        let patch_number = if main_ver.pre.is_empty() { main_ver.patch + 1} else { main_ver.patch }; 
+        Version {
+            major: main_ver.major,
+            minor: main_ver.minor,
+            patch: patch_number,
+            pre: make_dev_prerelease(main_ver.pre, mode, is_dirty)?,
+            build: BuildMetadata::EMPTY,
+        }
+    } else {
+        main_ver
     };
+    log::debug!("calculated version number is {}", &new_version);
+
     if cargo_ver < new_version {
         if dry_run {
             println!("Created version number {} (dry-run)", new_version);
@@ -327,7 +407,7 @@ fn run_check_tags() -> anyhow::Result<()> {
 }
 
 fn run_check_tags_repo(repo: &Repository) -> anyhow::Result<()> {
-    if !is_repo_dirty(repo, None) {
+    if !is_repo_dirty(repo, None)? {
         println!("No changes detected");
         return Ok(());
     }
@@ -381,7 +461,7 @@ mod tests {
     use std::io::Write;
     use std::path::Path;
     use tempfile::TempDir;
-    use Repository;
+    use {parse_cargo_version, Repository};
 
     use crate::{run_check_tags_repo, run_sem_ver_repo, VersioningKindArg};
 
@@ -500,5 +580,10 @@ mod tests {
 
         let cargotoml = std::fs::read_to_string(td.path().join("Cargo.toml")).unwrap();
         assert!(cargotoml.contains("0.1.1-dev.1"));
+    }
+
+    #[test]
+    fn test_parse_prerelease_version() {
+        parse_cargo_version(&"0.1.0-a2").unwrap();
     }
 }
