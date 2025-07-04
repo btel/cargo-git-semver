@@ -231,10 +231,15 @@ fn make_dev_prerelease(
 fn is_repo_dirty(repo: &Repository, filetype: Option<&str>) -> anyhow::Result<bool> {
    
     // Use revparse_single to get the object for the default branch
-    let obj = revparse_default_branch(repo, None)?;
+    let obj = revparse_default_branch(repo, None)?.id();
 
-    // Peel the object to a commit
-    let commit = obj.peel_to_commit()?;
+
+    let head_oid = repo.head()?.target().context("Invalid HEAD")?;
+
+    // Find the merge base (most recent common ancestor)
+    let merge_base = repo.merge_base(obj, head_oid)?;
+
+    let commit = repo.find_commit(merge_base)?;
 
     // Get the tree from the commit
     let tree = commit.tree()?;
@@ -338,13 +343,13 @@ fn run_sem_ver_repo(
 
     log::debug!("latest tag is {}", &latest_tag_str);
 
-    let changed_from_last_version =
-        check_rs_files_changed(repo, &latest_tag_str, "HEAD").unwrap_or(true);
+    // let changed_from_last_version =
+    //    check_rs_files_changed(repo, &latest_tag_str, "HEAD").unwrap_or(true);
 
-    if !is_dirty && !changed_from_last_version {
-        println!("No rust files changed since last tag {}", latest_tag_str);
-        return Ok(());
-    };
+    // if !is_dirty && !changed_from_last_version {
+    //    println!("No rust files changed since last tag {}", latest_tag_str);
+    //    return Ok(());
+    // };
 
     let mode = match mode_arg {
         VersioningKindArg::PEP440 => VersioningKind::PEP440,
@@ -355,7 +360,7 @@ fn run_sem_ver_repo(
 
     let main_ver = get_cargo_version_main(&repo)?;
     log::debug!("default branch version is {}", &main_ver);
-    let new_version = {
+    let new_version = if is_dirty {
         let patch_number = if main_ver.pre.is_empty() { main_ver.patch + 1} else { main_ver.patch }; 
         Version {
             major: main_ver.major,
@@ -364,6 +369,8 @@ fn run_sem_ver_repo(
             pre: make_dev_prerelease(main_ver.pre, mode, is_dirty)?,
             build: BuildMetadata::EMPTY,
         }
+    } else {
+        main_ver
     };
     log::debug!("calculated version number is {}", &new_version);
 
