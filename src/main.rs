@@ -123,7 +123,7 @@ fn revparse_default_branch<'repo>(repo: &'repo Repository, obj_name: Option<&'_ 
 
     let mut last_error = anyhow!("should not happen");
     let default_branch = repo.config()?.get_string("init.defaultBranch")?;
-    for branch_name in ["master", "main", &default_branch] {
+    for branch_name in ["refs/remotes/origin/main", "refs/remotes/origin/master", "master", "main", &default_branch] {
         let refname = if let Some(name) = obj_name {
             &format!("{}:{}", branch_name, name)
         }
@@ -135,6 +135,7 @@ fn revparse_default_branch<'repo>(repo: &'repo Repository, obj_name: Option<&'_ 
 
         match object {
             Ok(obj) => {
+                log::debug!("found default branch at {}", &branch_name); 
                 return Ok(obj)
             },
             Err(err) => {
